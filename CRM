@@ -179,3 +179,278 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+# ============================================
+# NUEVAS IMPORTACIONES PARA EL MÓDULO DE STOCK
+# ============================================
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from datetime import datetime
+import openai
+import json
+import re
+from typing import List, Optional
+
+# ============================================
+# CONFIGURACIÓN DE LA BASE DE DATOS
+# ============================================
+# Usamos SQLite para desarrollo. En producción se cambia a PostgreSQL.
+DATABASE_URL = "sqlite:///./stock.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# ============================================
+# MODELO DE PRODUCTO (Tabla en la DB)
+# ============================================
+class Producto(Base):
+    __tablename__ = "productos"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    nombre = Column(String, index=True, nullable=False)
+    descripcion = Column(Text, nullable=True)
+    precio = Column(Float, nullable=False)
+    costo = Column(Float, nullable=True)  # Costo real para calcular ganancia
+    stock = Column(Integer, nullable=False, default=0)
+    categoria = Column(String, index=True, nullable=True)
+    etiquetas = Column(String, nullable=True)  # Tags separados por coma: "urgente, oferta, nuevo"
+    proveedor = Column(String, nullable=True)
+    sku = Column(String, unique=True, index=True)  # Código interno
+    activo = Column(Boolean, default=True)
+    fecha_creacion = Column(DateTime, default=datetime.now)
+    fecha_actualizacion = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+# Crear las tablas en la base de datos
+Base.metadata.create_all(bind=engine)
+
+# ============================================
+# FUNCIONES DE IA PARA EL CATÁLOGO
+# ============================================
+
+def consultar_productos_por_ia(query: str, session: Session) -> List[Producto]:
+    """
+    Usa IA para interpretar la pregunta del cliente y buscar productos.
+    """
+    prompt = f"""
+    Eres un asistente de catálogo para una tienda. 
+    El cliente pregunta: "{query}"
+    
+    Debes responder SOLO con un JSON válido que contenga:
+    1. 'categoria': La categoría que busca (o null si no especifica).
+    2. 'palabras_clave': Lista de palabras clave para buscar en nombre y descripción.
+    3. 'precio_max': Precio máximo que sugiere (o null si no lo menciona).
+    
+    Ejemplo: Si el cliente dice "busco una mochila escolar barata", devuelve:
+    {{"categoria": "mochilas", "palabras_clave": ["escolar", "barata"], "precio_max": null}}
+    """
+    
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+        data = json.loads(response.choices[0].message.content)
+        
+        # Construir la consulta SQL basada en el análisis de IA
+        query_db = session.query(Producto).filter(Producto.activo == True)
+        
+        if data.get("categoria"):
+            query_db = query_db.filter(Producto.categoria.ilike(f"%{data['categoria']}%"))
+        
+        if data.get("palabras_clave"):
+            for palabra in data["palabras_clave"]:
+                query_db = query_db.filter(
+                    (Producto.nombre.ilike(f"%{palabra}%")) | 
+                    (Producto.descripcion.ilike(f"%{palabra}%")) |
+                    (Producto.etiquetas.ilike(f"%{palabra}%"))
+                )
+        
+        if data.get("precio_max"):
+            query_db = query_db.filter(Producto.precio <= float(data["precio_max"]))
+        
+        return query_db.limit(10).all()
+    
+    except Exception as e:
+        # Fallback: búsqueda simple por nombre
+        return session.query(Producto).filter(
+            Producto.nombre.ilike(f"%{query}%") | 
+            Producto.descripcion.ilike(f"%{query}%")
+        ).limit(5).all()
+
+def generar_respuesta_con_productos(productos: List[Producto], query: str) -> str:
+    """
+    Genera una respuesta amigable con los productos encontrados.
+    """
+    if not productos:
+        return f"Lo siento, no encontré productos que coincidan con '{query}'. ¿Podés ser más específico?"
+    
+    prompt = f"""
+    El cliente preguntó: "{query}"
+    
+    Estos son los productos que encontré en el catálogo:
+    {json.dumps([{"nombre": p.nombre, "precio": p.precio, "stock": p.stock} for p in productos], indent=2)}
+    
+    Genera una respuesta amigable, profesional y breve (máximo 3 oraciones) que:
+    1. Mencione los productos encontrados con sus precios.
+    2. Si algún producto tiene poco stock, avisa.
+    3. Ofrece ayuda para más detalles.
+    """
+    
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=200
+        )
+        return response.choices[0].message.content
+    except:
+        # Fallback
+        respuesta = "Encontré estos productos:\n"
+        for p in productos:
+            respuesta += f"- {p.nombre}: ${p.precio} ({p.stock} unidades disponibles)\n"
+        return respuesta
+
+# ============================================
+# ENDPOINTS PARA GESTIONAR PRODUCTOS
+# ============================================
+
+@app.post("/api/productos")
+async def crear_producto(producto_data: dict):
+    """Crea un nuevo producto en el catálogo."""
+    session = SessionLocal()
+    try:
+        # Validar datos mínimos
+        if not producto_data.get("nombre") or not producto_data.get("precio"):
+            raise HTTPException(400, {"error": "Nombre y precio son obligatorios"})
+        
+        # Generar SKU automático si no se proporciona
+        if not producto_data.get("sku"):
+            producto_data["sku"] = hashlib.md5(producto_data["nombre"].encode()).hexdigest()[:8].upper()
+        
+        nuevo_producto = Producto(**producto_data)
+        session.add(nuevo_producto)
+        session.commit()
+        session.refresh(nuevo_producto)
+        return {"status": "ok", "producto": {"id": nuevo_producto.id, "nombre": nuevo_producto.nombre}}
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(500, {"error": str(e)})
+    finally:
+        session.close()
+
+@app.get("/api/productos")
+async def listar_productos():
+    """Lista todos los productos activos."""
+    session = SessionLocal()
+    try:
+        productos = session.query(Producto).filter(Producto.activo == True).all()
+        return {
+            "productos": [
+                {
+                    "id": p.id,
+                    "nombre": p.nombre,
+                    "precio": p.precio,
+                    "stock": p.stock,
+                    "categoria": p.categoria,
+                }
+                for p in productos
+            ]
+        }
+    finally:
+        session.close()
+
+@app.get("/api/productos/buscar")
+async def buscar_productos(query: str):
+    """
+    Busca productos usando IA. Este endpoint se conecta con el chat.
+    """
+    session = SessionLocal()
+    try:
+        productos = consultar_productos_por_ia(query, session)
+        respuesta = generar_respuesta_con_productos(productos, query)
+        return {
+            "status": "ok",
+            "productos": [
+                {
+                    "nombre": p.nombre,
+                    "precio": p.precio,
+                    "stock": p.stock,
+                    "categoria": p.categoria,
+                }
+                for p in productos
+            ],
+            "respuesta": respuesta
+        }
+    finally:
+        session.close()
+
+@app.post("/api/productos/actualizar-stock")
+async def actualizar_stock(producto_id: int, cantidad: int):
+    """
+    Actualiza el stock de un producto. Usado cuando se vende o se repone.
+    """
+    session = SessionLocal()
+    try:
+        producto = session.query(Producto).filter(Producto.id == producto_id).first()
+        if not producto:
+            raise HTTPException(404, {"error": "Producto no encontrado"})
+        
+        nuevo_stock = producto.stock + cantidad
+        if nuevo_stock < 0:
+            raise HTTPException(400, {"error": "Stock insuficiente"})
+        
+        producto.stock = nuevo_stock
+        session.commit()
+        return {"status": "ok", "nuevo_stock": nuevo_stock}
+    finally:
+        session.close()
+
+# ============================================
+# INTEGRACIÓN CON EL CHAT DEL ASISTENTE
+# ============================================
+
+@app.post("/webhook/mensaje")
+async def recibir_mensaje(mensaje: dict, background_tasks: BackgroundTasks):
+    """
+    Endpoint universal para recibir mensajes.
+    AHORA CON INTEGRACIÓN DE CATÁLOGO.
+    """
+    cliente_id = mensaje.get("cliente_id") or mensaje.get("from")
+    texto = mensaje.get("mensaje") or mensaje.get("text", "")
+    
+    if not cliente_id or not texto:
+        raise HTTPException(400, {"error": "Faltan datos"})
+    
+    # Verificar si la pregunta es sobre productos
+    if any(palabra in texto.lower() for palabra in ["precio", "costo", "cuánto", "valor", "tienen", "stock", "disponible"]):
+        # Buscar en el catálogo
+        session = SessionLocal()
+        try:
+            productos = consultar_productos_por_ia(texto, session)
+            respuesta = generar_respuesta_con_productos(productos, texto)
+        finally:
+            session.close()
+    else:
+        # Si no es sobre productos, usar el asistente general
+        contexto = {"nombre": clientes_db.get(cliente_id, {}).get("nombre", "Cliente")}
+        respuesta = generar_respuesta(texto, contexto)
+    
+    # Guardar en historial y responder
+    if cliente_id not in clientes_db:
+        clientes_db[cliente_id] = {"nombre": "Cliente", "historial": []}
+    
+    clientes_db[cliente_id]["historial"].append({
+        "fecha": datetime.now().isoformat(),
+        "mensaje": texto,
+        "tipo": "recibido"
+    })
+    clientes_db[cliente_id]["historial"].append({
+        "fecha": datetime.now().isoformat(),
+        "mensaje": respuesta,
+        "tipo": "enviado"
+    })
+    
+    return {"status": "ok", "respuesta": respuesta}
