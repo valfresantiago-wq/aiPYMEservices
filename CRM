@@ -454,3 +454,14 @@ async def recibir_mensaje(mensaje: dict, background_tasks: BackgroundTasks):
     })
     
     return {"status": "ok", "respuesta": respuesta}
+fastapi==0.104.1
+uvicorn==0.24.0
+openai==1.6.1
+sqlalchemy==2.0.23
+python-dotenv==1.0.0
+httpx==0.25.1
+PyPDF2==3.0.1
+python-multipart==0.0.6
+aiofiles==23.2.1
+mercadopago==2.2.0
+pydantic==2.4.2
