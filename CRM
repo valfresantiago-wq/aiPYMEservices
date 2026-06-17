@@ -1,0 +1,181 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse
+import openai
+import os
+from dotenv import load_dotenv
+import httpx
+from datetime import datetime
+import json
+
+load_dotenv()
+
+app = FastAPI()
+
+# ============================================
+# CONFIGURACIÓN DEL SISTEMA
+# ============================================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
+
+# Base de datos en memoria (pronto PostgreSQL)
+clientes_db = {}
+pedidos_db = {}
+leads_db = {}
+
+# ============================================
+# FUNCIONES DE IA (El Cerebro)
+# ============================================
+def calificar_lead(mensaje: str) -> dict:
+    """Usa IA para analizar el mensaje y calificar al lead"""
+    prompt = f"""
+    Eres un asistente de ventas. Analiza este mensaje de un cliente:
+    "{mensaje}"
+    
+    Responde en JSON con:
+    1. Intención (Compra, Consulta, Reclamo, Spam)
+    2. Urgencia (Alta, Media, Baja)
+    3. Presupuesto estimado (Bajo, Medio, Alto)
+    4. Producto o servicio que busca (texto libre)
+    """
+    
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+    
+    return json.loads(response.choices[0].message.content)
+
+# ============================================
+# ENDPOINTS DEL SISTEMA
+# ============================================
+@app.post("/webhook/whatsapp")
+async def recibir_mensaje_whatsapp(mensaje: dict, background_tasks: BackgroundTasks):
+    """
+    Recibe mensajes de WhatsApp Business API
+    """
+    cliente_id = mensaje.get("from")
+    texto = mensaje.get("text", "")
+    
+    # Guardar cliente en DB (si no existe)
+    if cliente_id not in clientes_db:
+        clientes_db[cliente_id] = {
+            "nombre": mensaje.get("profile_name", "Anónimo"),
+            "primer_contacto": datetime.now().isoformat(),
+            "historial": []
+        }
+    
+    # Guardar mensaje en historial
+    clientes_db[cliente_id]["historial"].append({
+        "fecha": datetime.now().isoformat(),
+        "mensaje": texto
+    })
+    
+    # Analizar mensaje con IA (en background para no bloquear)
+    background_tasks.add_task(procesar_mensaje, cliente_id, texto)
+    
+    # Responder al cliente (por ahora, respuesta básica)
+    return {"status": "ok", "respuesta": "Gracias por tu mensaje. Un asistente te atenderá en breve."}
+
+async def procesar_mensaje(cliente_id: str, mensaje: str):
+    """
+    Procesa el mensaje con IA y guarda el resultado
+    """
+    # Calificar al lead
+    analisis = calificar_lead(mensaje)
+    
+    # Guardar análisis en el perfil del cliente
+    if cliente_id in clientes_db:
+        clientes_db[cliente_id]["ultimo_analisis"] = analisis
+        clientes_db[cliente_id]["lead_score"] = obtener_puntaje(analisis)
+    
+    # Si el lead es caliente, enviar notificación al dueño
+    if analisis.get("Urgencia") == "Alta" and analisis.get("Intención") == "Compra":
+        await notificar_lead_caliente(cliente_id, analisis)
+
+def obtener_puntaje(analisis: dict) -> int:
+    """Asigna un puntaje al lead basado en el análisis"""
+    puntaje = 0
+    if analisis.get("Urgencia") == "Alta":
+        puntaje += 50
+    if analisis.get("Intención") == "Compra":
+        puntaje += 30
+    if analisis.get("Presupuesto estimado") == "Alto":
+        puntaje += 20
+    return puntaje
+
+async def notificar_lead_caliente(cliente_id: str, analisis: dict):
+    """
+    Envía una notificación al dueño del negocio (por WhatsApp o Email)
+    """
+    # Aquí va la integración con WhatsApp, Telegram o Email
+    # Por ahora, solo imprimimos en consola
+    print(f"🔥 LEAD CALIENTE: {cliente_id} - {analisis}")
+    print(f"   Producto: {analisis.get('Producto o servicio que busca')}")
+    print(f"   Urgencia: {analisis.get('Urgencia')}")
+
+# ============================================
+# FRONTEND: Panel de Administración
+# ============================================
+@app.get("/admin", response_class=HTMLResponse)
+async def panel_admin():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Panel de Administración</title>
+        <style>
+            body { font-family: Arial; background: #f0f4f8; padding: 20px; }
+            .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 24px; box-shadow: 0 12px 40px rgba(0,0,0,0.1); }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            th { background: #3182ce; color: white; padding: 12px; text-align: left; }
+            td { padding: 12px; border-bottom: 1px solid #e2e8f0; }
+            .caliente { background: #fed7d7; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📊 Panel de Administración</h1>
+            <p>Clientes registrados y su calificación.</p>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>Cliente</th>
+                        <th>Mensajes</th>
+                        <th>Puntaje</th>
+                        <th>Última Intención</th>
+                        <th>Urgencia</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Cliente de ejemplo</td>
+                        <td>3</td>
+                        <td>80</td>
+                        <td>Compra</td>
+                        <td>Alta</td>
+                    </tr>
+                </tbody>
+            </table>
+            
+            <p style="margin-top: 20px; color: #4a5568;">
+                <small>Los datos se actualizan en tiempo real.</small>
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+
+# ============================================
+# HEALTH CHECK
+# ============================================
+@app.get("/health")
+async def health():
+    return {"status": "ok", "clientes": len(clientes_db)}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
